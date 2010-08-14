@@ -1,194 +1,278 @@
-#include <math.h>
-#include "Wire.h" 
-#include "BlinkM_funcs.h" 
+/*
+    ______ ______ __   __      __     __ ______ __  __ ______ __  __ ______
+   /\  ___\\  == \\ "-.\ \    /\ \  _ \ \\  == \\ \/ / \  ___\\ \_\ \\  == \
+   \ \ \____\  __< \ \-.  \   \ \ \/ ".\ \\  __< \  _"-.\___  \\  __ \\  _-/
+    \ \_____\\_____\\ \_\\"\   \ \ \__/".~\\ \_\ \\ \_\ \\_____\\_\ \_\\_\
+     \/_____//_____//_/ \/_/    \/_/   \/_//_/ /_//_/\/_//_____//_/\/_//_/
 
-///////////////////////////////////////////
+   ---What?---
+   Combined "master" firmware for Excellent Adventure.
+   Controls LED panels, dumb LEDs, SLIC, and takes analog
+   sound and ambient light inputs.
 
-//pin config
-const int audioPin  = 2;
-const int ringPin   = 2;
-const int enablePin = 3;
-const int buttonPin = 4;
-const int switchHookPin = 5;
-const int voltagePin = 12;
+   ---Why?---
+   www.carbonworkshop.com/bm10
 
-//ringer vars
-const int ringDelay = 40; //50ms = 20Hz
-const int ringSpacing = 220;
+   ---Who?---
+   Chris Condrat  - chris@g6net.com
+   Gustavo Huber  - gush@carbonworkshop.com
+   Daniel Massey  - pichiste@gmail.com
+   Ryan Alexander - ryan@onecm.com
 
-//audio vars
-int voiceLevel = 0;
-const int zeroOffset = 505;
+   ---When?---
+   June 11, 2010
+ */
 
-//blinkM addressing vars
-//const int  X_COUNT = 6;
-//const int  Y_COUNT = 3;
-//const int  NUM_BLINKMS = 18;
-//const byte FIRST_BLINKM_ADDR = 5;
-const int  X_COUNT = 2;
-const int  Y_COUNT = 6;
-const int  NUM_BLINKMS = 12;
-const byte FIRST_BLINKM_ADDR = 5;
-byte addresses[X_COUNT][Y_COUNT];
-byte pixelVals[X_COUNT][Y_COUNT][3];
-
-//modes
-const int IDLE = 0;
-const int RINGING = 1;
-const int ACTIVE = 2;
-int state = IDLE;
-
-//animations
-int animationIndex = 0;
+#include <Wire.h>
+#include <WProgram.h>
+#include <TimerOne.h>
 
 
-///////////////////////////////////////////
-void setup() {
-  Serial.begin(19200);
-  initRinger();
-  initBlinkM(); 
-  defineBlinkMAddresses();
-  initPixelVals();    
+#define DEBUG
+
+#include "EffectManager.h"
+#include "Slic.h"
+#include "Effects.h"
+
+// Blinks an LED on the Arduino to indicate operation
+#define BLINK_ENABLED
+
+#define SERIAL_ENABLED
+
+// Define if this is the master booth
+#define BOOTH_MASTER
+
+//
+#define POLLING_DELAY           1000
+
+#define PERIOD_MICROSEC         50000
+#define PANELS_WIDTH            9
+#define PANELS_HEIGHT           10
+
+#define STATE_IDLE              0
+#define STATE_RING              1
+#define STATE_CALL              2
+#define STATE_CALLENDED         3
+#define STATE_BUSY              4
+
+#define PIN_SENSOR_LIGHT        0
+
+#define MAX_CALL_DURATION_MS    (15*60*1000)
+
+#define MAX_CALLEND_WAIT_MS     (2*1000)
+
+#define EFFECT_CALLBACK_MS      20
+#define BLINK_MS                1000
+
+//          +--------+   +--------+
+//  Tip ----| SLIC_L |   | SLIC_L |
+//          |        |   |        |
+//  Ring ---|        |   |        |
+//          +--------+   +--------+
+//            |    |       |    |
+//          +---------------------+
+//          |                     |
+//          |                     |
+//          |                     |
+//          |                     |
+//          |                     |
+//          +---------------------+
+
+// L = Local; R = Remote
+
+unsigned int time0;
+unsigned long callTime;
+
+unsigned int blinkTime0;
+bool blinkMode;
+bool callEnded;
+
+char state;
+#ifdef DEBUG
+char debugState;
+#endif
+
+EffectManager EM(PERIOD_MICROSEC);
+SLICControl SC;
+
+Effect effects[] =
+{
+    {&Spotlight, 0}
+,   {&SimpleColumns, 0}
+};
+
+
+void setup()
+{
+    state = STATE_IDLE;
+
+    // Pin assignments
+
+#ifdef SERIAL_ENABLED
+    Serial.begin(38400);
+#endif
+
+    EM.AddEffectsArrays(
+        effects, 1,
+        effects, 1,
+        effects, 1
+    );
+    EM.SetMode(EM_MODE_IDLE);
+    EM.InitPanels();
+
+    SC.InitSLICPins();
+
+    time0 = millis();
+
+#ifdef DEBUG
+    debugState = -1;
+#endif
+
+#ifdef BLINK_ENABLED
+    blinkMode = false;
+    pinMode(13, OUTPUT);
+    blinkTime0 = time0;
+#endif
+    //EM.InstallAnimator();
 }
 
-///////////////////////////////////////////
-void loop() {
-  
-  while(state==IDLE) {
-     //do nothing... except check for ringing  
-    if(digitalRead(buttonPin) == HIGH) { /* need to add conditional for whether receiver is on hook */
-      state = RINGING;  
-      digitalWrite(enablePin, HIGH);      
-      Serial.println("ringing... ");
-      delay(10);      
-    }    
-  }
-  
-  while(state==RINGING) {
-    
-    ring();
-    delay(ringSpacing);
-  
-    //check to see if phone has been picked up
-    if(digitalRead(switchHookPin == HIGH)) {
-      state = ACTIVE;      
-      digitalWrite(enablePin, LOW);   
-      Serial.println("active ");   
+// Both on hook -> enable ringing
+// OffHook -> Ring other phone -> OffHook Other phone -> Ring off
+// -> Hang-up phone -> wait for other hang-up
+
+
+
+void loop()
+{
+    // PollOffHooks returns
+    unsigned long time1 = SC.Poll();
+    bool offHookRemote = SC.IsOffHookRemote();
+    bool offHookLocal = SC.IsOffHookLocal();
+
+#ifdef DEBUG
+    if (debugState != state)
+    {
+        debugState = state;
+        switch (state)
+        {
+        case STATE_IDLE:
+            Serial.println("State: IDLE");
+            break;
+        case STATE_RING:
+            Serial.println("State: RING");
+            break;
+        case STATE_CALL:
+            Serial.println("State: CALL");
+            break;
+        case STATE_CALLENDED:
+            Serial.println("State: CALL ENDED");
+            break;
+        default:
+            Serial.print("State: UNKNOWN val = ");
+            Serial.println(state);
+            break;
+        }
     }
-    
-    //check to s=ee if other phone has been hung up
-    // unimplemented...
-    
-    delay(ringSpacing);    
-  }
-  
-  while(state==ACTIVE) {
-    
-    processAudio();   
-//    int ai = analogRead(audioPin);
-//    voiceLevel = map(ai, zeroOffset, 800, 0, 255);
-//    voiceLevel = constrain(voiceLevel, 0, 255); 
-//    Serial.println(voiceLevel);
-      
-    //update pixels here
-    vl_update();
-    
-    //send color values to BlinkMs  
-    sendToBlinkMs();
-    
-    //necessary delay 
-    delay(5);     
-    
-    //check to see if this phone has been hung up
-    if(digitalRead(switchHookPin) == LOW) {
-      voiceLevel = 0;
-      BlinkM_setRGB(0, 0x00, 0x00, 0x00);      
-      state = IDLE; 
-      Serial.println("idle ");
+#endif
+
+    switch (state)
+    {
+    case STATE_IDLE:
+        if (offHookLocal || offHookRemote)
+        {
+            // Audio.PlayDialTone();
+            state = STATE_RING;
+            if (offHookLocal)
+            {
+                SC.StartRingingRemote();
+            } else {
+                SC.StartRingingLocal();
+            }
+        }
+        break;
+    case STATE_RING:
+        if (offHookLocal && offHookRemote)
+        {
+            // Both phones picked up.  Start the call!
+            // Audio.StopDialTone();
+            state = STATE_CALL;
+            SC.StopRingingAll();
+            // Start the call timer.
+            callEnded = false;
+
+            callTime = time1;
+        }
+        else if (!offHookLocal && !offHookRemote)
+        {
+            // Hangup, both receivers were hung up.
+            // Audio.StopDialTone();
+            state = STATE_IDLE;
+            SC.StopRingingAll();
+        }
+        // Else do nothing
+
+        break;
+    case STATE_CALL:
+        if (offHookLocal && offHookRemote){
+            // Call is in progress
+            // If we want to resume the call:
+            if (callEnded)
+            {
+                // If we resumed our call after one party hung up.
+                //Audio.StopDialTone();
+                callEnded = false;
+            }
+            if ((time1 - callTime) > MAX_CALL_DURATION_MS)
+            {
+                // Force a disconnection, i.e. cut the audio connection, and
+                // inject our own message.
+            }
+        }
+        else if (!offHookRemote && !offHookLocal){
+            // Both people hung up, return to idle.
+            callEnded = true;
+            callTime = time1;
+            // We use the same call time to delay the
+            // circuit reset.
+            state = STATE_CALLENDED;
+        }
+        else{
+            // Someone hung up, but don't return to idle until the other
+            // person did.
+            //
+            // Technically the call ended, should we allow the call to resume
+            // if the receiver is picked up?
+            callEnded = true;
+
+            // Maybe wait a few seconds and allow someone to pick up?
+
+            // If not, we need to also severe any audio transmission
+
+            // Audio.SetTrack(CALL_DONE);
+            // Audio.PlayDialTone();
+        }
+        break;
+    case STATE_CALLENDED:
+        if ((time1 - callTime) > MAX_CALLEND_WAIT_MS){
+            state = STATE_IDLE;
+        }
+        break;
+
+    default:
+        break;
+
+    };
+    if ((time1 - time0) > EFFECT_CALLBACK_MS)
+    {
+        time0 = time1;
+        EM.Callback();
     }
-    
-    //check if other phone has been hung up
-    //unimplemented...
-    
-  }
-  
-}
-
-///////////////////////////////////////////
-void ring() {
-  for(int i = 0; i < 5; i++) {
-    //for(int ringDelay = 100; ringDelay>10; ringDelay=ringDelay-10){
-    digitalWrite(ringPin, LOW);
-    Serial.print("di");
-    delay(ringDelay);
-    digitalWrite(ringPin, HIGH);
-    Serial.print("ng ");
-    delay(ringDelay);
-    Serial.print(ringDelay);
-    Serial.print(" ");
-    //} 
-  }
-  
-}
-
-///////////////////////////////////////////
-void initBlinkM() {
-  BlinkM_begin();
-  BlinkM_stopScript(0);  
-  BlinkM_setRGB(0, 0x00, 0x00, 0x00);
-}
-
-///////////////////////////////////////////
-// Maps the blinkM addresses to x, y coordinates
-void defineBlinkMAddresses() {
-  byte addr = FIRST_BLINKM_ADDR;
-  for(int x=0; x<X_COUNT; x++) {
-    for(int y=Y_COUNT-1; y>=0; y--) {
-      addresses[x][y] = addr;
-      addr++; 
-    }  
-  }
-}
-
-///////////////////////////////////////////
-// Init pixel values to zero
-void initPixelVals() {
-  for(int x=0; x<X_COUNT; x++) {
-    for(int y=0; y<Y_COUNT; y++) {
-      pixelVals[x][y][0] = 0; //r
-      pixelVals[x][y][1] = 1; //g
-      pixelVals[x][y][2] = 2; //b
-    } 
-  }  
-}
-
-///////////////////////////////////////////
-
-void sendToBlinkMs() {
-  for(int x=0; x<X_COUNT; x++) {
-    for(int y=0; y<Y_COUNT; y++) {
-      byte addr = addresses[x][y];
-      BlinkM_setRGB(addr, pixelVals[x][y][0], pixelVals[x][y][1], pixelVals[x][y][2]);
-    }  
-  }  
-}
-
-///////////////////////////////////////////
-void setPixel(int x, int y, byte r, byte g, byte b) {
-  pixelVals[x][y][0] = r;
-  pixelVals[x][y][1] = g;
-  pixelVals[x][y][2] = b;  
-}
-
-void initRinger() {
-  pinMode(ringPin, OUTPUT);
-  pinMode(enablePin, OUTPUT);
-  pinMode(buttonPin, INPUT);
-  pinMode(switchHookPin, INPUT);
-  pinMode(voltagePin, OUTPUT);
-  digitalWrite(ringPin, HIGH);
-  digitalWrite(enablePin, LOW);
-  digitalWrite(voltagePin, HIGH);
-//  Serial.println("RM LOW LOW LOW LOW LOW");
-  analogReference(DEFAULT); /* sets the input range for the audio. should be modified. */
+#ifdef BLINK_ENABLED
+    if ((time1 - blinkTime0) > BLINK_MS){
+        blinkTime0 = time1;
+        blinkMode = !blinkMode;
+        digitalWrite(13, blinkMode ? HIGH : LOW);
+    }
+#endif
+    //delay(POLLING_DELAY);
 }
